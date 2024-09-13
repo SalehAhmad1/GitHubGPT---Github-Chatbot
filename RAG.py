@@ -1,4 +1,3 @@
-
 import os
 import shutil
 import time
@@ -7,8 +6,10 @@ from dotenv import load_dotenv
 from git import Repo
 from langchain_milvus import Milvus
 from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import GitLoader
 from openai import OpenAI
+
 class GitHubGPT:
     def __init__(self):
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -18,6 +19,7 @@ class GitHubGPT:
         self.system_prompt = self.__initialize_system_prompt()
         self.thread_id = None
         self.assistant_id = self.__create_assistant(name='Github GPT', instructions='Please address the user as Github GPT')
+        self.thread_messages = []  # Store the conversation history
 
     def __initialize_embeddings(self):
         return OpenAIEmbeddings(
@@ -47,6 +49,56 @@ class GitHubGPT:
     @staticmethod
     def __clean_repo_name(name):
         return name.replace('-', '_')
+    
+    @staticmethod
+    def __declean_repo_name(name):
+        return name.replace('_', '-')
+    
+    def __add_repo_data_to_db(self):
+        data = self.loader.load()
+        print(f'Length of Data to Add: {len(data)}')
+        print(f'Adding Data to Milvus Vector DB')
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        data = text_splitter.split_documents(data)
+        self.vector_db.add_documents(documents=data)
+        print(f'Done Adding Data to Milvus Vector DB')
+    
+    def add_repo(self, repo_url):
+        repo_name = repo_url.split('/')[-1]
+        repo_save_path = f"./Data/Repos"
+        if not os.path.exists(repo_save_path):
+            os.makedirs(repo_save_path)
+        else:
+            shutil.rmtree(repo_save_path)
+            os.makedirs(repo_save_path)
+        repo_save_path = repo_save_path + "/" + self.__clean_repo_name(repo_name)
+        
+        print(f'Cloning the repo from: {repo_url}')
+        repo = Repo.clone_from(
+            repo_url, 
+            to_path=repo_save_path,
+            branch="master"
+        )
+        print(f'Repo Cloned to: {repo_save_path}')
+        self.repo_save_path = repo_save_path
+        self.branch = repo.head.reference
+        self.loader = GitLoader(repo_path=repo_save_path, branch=self.branch)
+        self.__add_repo_data_to_db()
+
+    def load_repo(self):
+        repo_save_path = "./Data/Repos"
+        repo_name = os.listdir(repo_save_path)[0]
+        self.repo_save_path = repo_save_path + "/" + repo_name
+        self.branch = "master"
+        print(f'Loading repo: {repo_name}')
+        print(f'Branch: {self.branch}')
+        print(f'Repo path: {self.repo_save_path}')
+        self.loader = GitLoader(repo_path=self.repo_save_path, branch=self.branch)
+        self.__add_repo_data_to_db()
 
     def __create_assistant(self, name, instructions, model="gpt-3.5-turbo-16k"):
         assistant = self.client.beta.assistants.create(
@@ -67,61 +119,56 @@ class GitHubGPT:
     @staticmethod
     def __concatenate_documents(documents):
         print(f'Length of docs to concatenate: {len(documents)}')
-        All_content = ''
+        all_content = ''
         for idx, doc in enumerate(documents):
             print(f"Retrieved Document: {idx} --- [{doc.metadata}]")
-            All_content += "Chunk:" + str(idx) + ":\n" + doc.page_content + "\n\n"
+            all_content += "Chunk:" + str(idx) + ":\n" + doc.page_content + "\n\n"
         print("\n\n")
-        return All_content
+        return all_content
 
     def query(self, prompt, instructions="Please address the user as Github User"):
         # Step 1: Retrieve relevant documents based on the user's query
         retrieved_documents = self.__retrieve_documents(prompt)
         context = self.__concatenate_documents(retrieved_documents)
 
-        # Step 2: Create a thread using the retrieved context and user prompt
+        # Step 2: Add the new user prompt and context to the conversation history
         user_query = f"Context from codebase: {context}\nUser query: {prompt}\n"
-        thread = self.client.beta.threads.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": user_query,
-                }
-            ]
-        )
-        self.thread_id = thread.id
-        print(f'Thread created with ID: {self.thread_id}')
+        self.thread_messages.append({
+            "role": "user",
+            "content": user_query,
+        })
 
-        # Step 3: Run the assistant on the created thread
+        # Step 3: If there's no existing thread, create a new one; otherwise, append to the existing thread
+        if not self.thread_id:
+            thread = self.client.beta.threads.create(
+                messages=self.thread_messages
+            )
+            self.thread_id = thread.id
+            print(f'Thread created with ID: {self.thread_id}')
+        else:
+            print(f'Using the existing thread ID: {self.thread_id}')
+            # Add the new message to the existing thread
+            self.client.beta.threads.messages.create(
+                thread_id=self.thread_id,
+                role="user",
+                content=user_query
+            )
+
+        Messages = self.client.beta.threads.messages.list(thread_id=self.thread_id)
+        print(f'Count of messages(input prompt + generated response) in the thread:', len(Messages.data))
+
+        # Step 4: Run the assistant on the created or updated thread
         run = self.client.beta.threads.runs.create(
             thread_id=self.thread_id,
             assistant_id=self.assistant_id,
             instructions=instructions,
+            stream=True,
         )
-
-        # Step 4: Wait for the assistant's response
-        self.wait_for_run_completion(self.client, thread_id=self.thread_id, run_id=run.id)
-
-    def wait_for_run_completion(self, client, thread_id, run_id, sleep_interval=5):
-        while True:
+        
+        text = ''
+        for event in run:
             try:
-                run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
-                if run.completed_at:
-                    elapsed_time = run.completed_at - run.created_at
-                    formatted_elapsed_time = time.strftime(
-                        "%H:%M:%S", time.gmtime(elapsed_time)
-                    )
-                    print(f"Run completed in {formatted_elapsed_time}")
-                    logging.info(f"Run completed in {formatted_elapsed_time}")
-                    # Get messages here once the run is completed!
-                    messages = client.beta.threads.messages.list(thread_id=thread_id)
-                    print(f'All messages: {messages.data}\n')
-                    last_message = messages.data[0]
-                    response = last_message.content[0].text.value
-                    print(f"Assistant Response: {response}\n\n****\n\n")
-                    break
-            except Exception as e:
-                logging.error(f"An error occurred while retrieving the run: {e}")
-                break
-            logging.info("Waiting for run to complete...")
-            time.sleep(sleep_interval)
+                text = event.data.delta.content[0].text.value
+                yield text
+            except:
+                continue
