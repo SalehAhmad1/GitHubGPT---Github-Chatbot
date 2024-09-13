@@ -10,7 +10,8 @@ load_dotenv()
 @st.cache_resource
 def initialize_gpt():
     bot = GitHubGPT()
-    bot.load_repo()
+    bot.add_repo('https://github.com/SaschaNe/creatify-app')
+    # bot.load_repo()
     return bot
 
 gpt_bot = initialize_gpt()
